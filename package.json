@@ -1,0 +1,70 @@
+{
+  "name": "econet-api-client",
+  "version": "1.0.0",
+  "description": "EcoNet API Client for TypeScript: Cognito SRP auth, SigV4 REST, AWS IoT MQTT streams, and profile-based labels.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/m-szopinski/econet-api-client"
+  },
+  "homepage": "https://github.com/m-szopinski/econet-api-client#readme",
+  "bugs": {
+    "url": "https://github.com/m-szopinski/econet-api-client/issues"
+  },
+  "keywords": [
+    "econet",
+    "ecoNET",
+    "api-client",
+    "typescript",
+    "aws-iot",
+    "mqtt",
+    "cognito",
+    "sigv4"
+  ],
+  "scripts": {
+    
+    "dev:client": "tsx watch src/examples/clientDemo.ts",
+  "dev:mqtt": "tsx watch src/examples/mqttStreamsDemo.ts",
+  "demo:once": "tsx src/examples/clientDemo.ts",
+  "demo:mqtt:once": "tsx src/examples/mqttStreamsDemo.ts",
+    
+  "build": "rm -rf dist && tsc -p tsconfig.json",
+    "prepublishOnly": "npm run -s build",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.3",
+    "dotenv": "^16.4.5"
+  },
+  "dependencies": {
+    "@aws-crypto/sha256-js": "^5.2.0",
+    "@aws-sdk/client-cognito-identity": "^3.679.0",
+    "@aws-sdk/client-cognito-identity-provider": "^3.679.0",
+  "@aws-sdk/protocol-http": "^3.370.0",
+    "@aws-sdk/hash-node": "^3.370.0",
+    "@aws-sdk/signature-v4": "^3.370.0",
+    "amazon-cognito-identity-js": "^6.3.13",
+    "aws-iot-device-sdk-v2": "^1.23.1",
+    "rxjs": "^7.8.1",
+    "uuid": "^13.0.0"
+  }
+}
