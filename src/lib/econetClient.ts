@@ -4,6 +4,8 @@ import { getCognitoIdentityCredentials } from '../services/cognitoIdentity.js';
 import { createSigv4Fetcher } from '../services/sigv4Fetch.js';
 import { connectAwsIotCrt } from '../iot/mqttCrt.js';
 import { installationNotifications$ as streamInstallationNotifications$, installationResponse$ as streamInstallationResponse$, TopicMessage, sendInstallationRequest as publishInstallationRequest } from '../iot/streams.js';
+import type { MqttLikeConnection } from '../iot/streams.js';
+import { buildPahoConnectionInfo, type PahoConnectionInfo } from '../iot/pahoInfo.js';
 import { defer, switchMap, Observable, map } from 'rxjs';
 import { generateClientId } from '../utils/clientId.js';
 import type { ProfileJson } from '../services/api.js';
@@ -51,6 +53,8 @@ export type EcoNetAPIClient = {
   ) => Promise<Array<{ key: string; title: string; unit?: string }>>;
   getProfile: ApiClients['app']['getProfile'];
   postRegisteredDataValues: ApiClients['econet']['postRegisteredDataValues'];
+  /** Compute Paho WebSocket connection info (presigned URL, host, clientId) without attempting CRT. */
+  getPahoConnectionInfo: (clientIdOverride?: string, expiresInSeconds?: number) => Promise<PahoConnectionInfo>;
   installationNotifications$: (installationId: string, opts?: MqttStreamOptions) => Observable<TopicMessage>;
   installationResponse$: (installationId: string, clientId?: string, opts?: MqttStreamOptions) => Observable<TopicMessage>;
   sendInstallationRequest: (installationId: string, body: unknown, clientIdOverride?: string) => Promise<void>;
@@ -94,7 +98,7 @@ export class EcoNetClient {
   private region!: string;
   private appBaseUrl!: string;
   private api!: ApiClients;
-  private mqttConnPromise: Promise<{ connection: import('aws-iot-device-sdk-v2').mqtt.MqttClientConnection; clientId: string }> | null = null;
+  private mqttConnPromise: Promise<{ connection: MqttLikeConnection; clientId: string }> | null = null;
   private labelsCache = new Map<string, Record<string, { title: string; unit?: string }>>();
   private awsCredentials!: { accessKeyId: string; secretAccessKey: string; sessionToken?: string };
   private iotEndpoint!: string;
@@ -109,6 +113,13 @@ export class EcoNetClient {
 
   static async create(init: EcoNetInit): Promise<EcoNetClient> {
     const self = new EcoNetClient();
+    // Node-only (Homey) hardening: ensure HOME exists and avoid reading shared AWS config
+    if (typeof window === 'undefined') {
+      try {
+        if (!process.env.HOME && !process.env.USERPROFILE) process.env.HOME = '/tmp';
+        if (!process.env.AWS_SDK_LOAD_CONFIG) process.env.AWS_SDK_LOAD_CONFIG = '0';
+      } catch {}
+    }
     const { username, password, region, userPoolId, clientId, identityPoolId, iotEndpoint, appBaseUrl, econetBaseUrl, siteBaseUrl, debug } = init;
     if (!username) throw new Error('username is required');
     if (!password) throw new Error('password is required');
@@ -168,18 +179,102 @@ export class EcoNetClient {
     return self;
   }
 
-  private async ensureMqtt() {
+  private async ensureMqtt(): Promise<{ connection: MqttLikeConnection; clientId: string }> {
     if (!this.mqttConnPromise) {
-      const clientId = generateClientId(this.region);
-      this.mqttConnPromise = connectAwsIotCrt({
-        endpoint: this.iotEndpoint,
-        region: this.region,
-        clientId,
-        credentials: this.awsCredentials,
-      }).then((connection) => ({ connection, clientId }));
+      // Compute the clientId and presigned URL upfront so both CRT and Paho share the same clientId
+      const prelim = await this.getPahoConnectionInfo(undefined, 900);
+      const clientId = prelim.clientId;
+      // Node/Homey default: CRT first, then automatic fallback to Paho (no control params)
+      const loadPaho = async (): Promise<any> => {
+        const inSrc = /\/(src|source)\//.test(import.meta.url);
+        const primary = inSrc ? '../iot/mqttPaho.ts' : '../iot/mqttPaho.js';
+        const fallback = inSrc ? '../iot/mqttPaho.js' : '../iot/mqttPaho.ts';
+        const tryImport = async (spec: string) => {
+          try {
+            const resolver: any = (import.meta as any).resolve;
+            const resolved = typeof resolver === 'function' ? await resolver(spec) : spec;
+            return await import(resolved);
+          } catch (e) {
+            return await import(spec); // final attempt without resolve
+          }
+        };
+        try {
+          return await tryImport(primary);
+        } catch (e1) {
+          try {
+            return await tryImport(fallback);
+          } catch (e2: any) {
+            const msg = e2?.message || (e1 as any)?.message || String(e2 || e1);
+            throw new Error(`Cannot resolve mqttPaho module: ${msg}`);
+          }
+        }
+      };
+      this.mqttConnPromise = (async () => {
+        try {
+          const crt = await connectAwsIotCrt({
+            endpoint: this.iotEndpoint,
+            region: this.region,
+            clientId,
+            credentials: this.awsCredentials,
+          });
+          const wrapper: MqttLikeConnection = {
+            async subscribe(topic: string, qos: number, handler: (t: string, p: ArrayBuffer | Buffer) => void) {
+              await crt.subscribe(topic, qos as any, (t: string, payload: ArrayBuffer) => handler(t, Buffer.from(payload as any)));
+            },
+            async unsubscribe(topic: string) { await crt.unsubscribe(topic); },
+            async publish(topic: string, payload: string, qos: number) { await crt.publish(topic, payload, qos as any, false); },
+          };
+          if (this.debug) console.log('[MQTT] using CRT transport');
+          return { connection: wrapper, clientId };
+        } catch (e: any) {
+          const reason = e?.message || e?.name || String(e);
+          console.warn('[MQTT] CRT unavailable, falling back to Paho:', reason);
+          const pahoMod: any = await loadPaho();
+          const info = await this.getPahoConnectionInfo(clientId, 900);
+          const connection: MqttLikeConnection = await pahoMod.connectAwsIotPaho({
+            endpoint: this.iotEndpoint,
+            region: this.region,
+            clientId,
+            credentials: this.awsCredentials,
+            origin: info.recommended.origin,
+          });
+          if (this.debug) console.log('[MQTT] using Paho transport (fallback)');
+          return { connection, clientId };
+        }
+      })();
     }
-    return this.mqttConnPromise;
+    return this.mqttConnPromise!;
   }
+
+  /**
+   * Compute Paho-compatible connection info (host, presigned WSS URL, clientId) using current credentials,
+   * without touching the CRT. Safe to call for diagnostics/logging. The URL contains sensitive parameters —
+   * use the redacted version for logs.
+   */
+  getPahoConnectionInfo = async (
+    clientIdOverride?: string,
+    expiresInSeconds = 900
+  ): Promise<PahoConnectionInfo> => {
+    const clientId = clientIdOverride ?? generateClientId(this.region);
+    const info = await buildPahoConnectionInfo({
+      endpoint: this.iotEndpoint,
+      region: this.region,
+      credentials: this.awsCredentials,
+      clientId,
+      expiresIn: expiresInSeconds,
+      origin: 'https://econetcloud.eu',
+    });
+    if (this.debug) {
+      // eslint-disable-next-line no-console
+      console.log('[PAHO][info]', {
+        host: info.host,
+        region: info.region,
+        clientId: info.clientId,
+        url: info.presignedUrlRedacted,
+      });
+    }
+    return info;
+  };
 
   private buildLabels(profile: ProfileJson): Record<string, { title: string; unit?: string }> {
     const labels: Record<string, { title: string; unit?: string }> = Object.create(null);

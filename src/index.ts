@@ -15,3 +15,4 @@ export type {
   RegisteredDataValuesResponse,
   UserNotificationsResponse,
 } from './services/api.js';
+export type { PahoConnectionInfo } from './iot/pahoInfo.js';

@@ -1,5 +1,14 @@
 import { Observable, Subscriber } from 'rxjs';
-import { mqtt } from 'aws-iot-device-sdk-v2';
+
+// A minimal MQTT-like connection contract used by both CRT and potential fallbacks
+export type QoS = 0 | 1 | 2;
+export type MessageHandler = (topic: string, payload: ArrayBuffer | Buffer) => void;
+export type MqttLikeConnection = {
+  // Use permissive return types (any) to be structurally compatible with CRT (which returns Promise<MqttSubscribeRequest>)
+  subscribe: (topic: string, qos: QoS, handler: MessageHandler) => any;
+  unsubscribe: (topic: string) => any;
+  publish: (topic: string, payload: string, qos: QoS) => any;
+};
 
 export type TopicMessage = {
   topic: string;
@@ -29,9 +38,9 @@ function parsePayload(payload: ArrayBuffer | Buffer): { text: string; json?: unk
 }
 
 function topic$(
-  connection: mqtt.MqttClientConnection,
+  connection: MqttLikeConnection,
   topic: string,
-  qos: mqtt.QoS = mqtt.QoS.AtLeastOnce
+  qos: QoS = 1
 ): Observable<TopicMessage> {
   return new Observable<TopicMessage>((subscriber: Subscriber<TopicMessage>) => {
     let unsubscribed = false;
@@ -39,25 +48,25 @@ function topic$(
       const parsed = parsePayload(p);
       subscriber.next({ topic: t, ...parsed });
     };
-    connection
-      .subscribe(topic, qos, onMessage)
+    Promise.resolve(connection
+      .subscribe(topic, qos, onMessage) as any)
       .then(() => {
         if (unsubscribed) {
           // If the subscriber already unsubscribed, immediately clean up
-          return connection.unsubscribe(topic).catch(() => {});
+          return Promise.resolve(connection.unsubscribe(topic) as any).catch(() => {});
         }
       })
       .catch((err) => subscriber.error(err));
 
     return () => {
       unsubscribed = true;
-      connection.unsubscribe(topic).catch(() => {});
+      Promise.resolve(connection.unsubscribe(topic) as any).catch(() => {});
     };
   });
 }
 
 export function installationNotifications$(
-  connection: mqtt.MqttClientConnection,
+  connection: MqttLikeConnection,
   installationId: string
 ): Observable<TopicMessage> {
   const topic = `${installationId}/installationNotifications`;
@@ -65,7 +74,7 @@ export function installationNotifications$(
 }
 
 export function installationResponse$(
-  connection: mqtt.MqttClientConnection,
+  connection: MqttLikeConnection,
   installationId: string,
   clientId: string
 ): Observable<TopicMessage> {
@@ -76,17 +85,17 @@ export function installationResponse$(
 // --- Publishers ---
 
 export async function publishJson(
-  connection: mqtt.MqttClientConnection,
+  connection: MqttLikeConnection,
   topic: string,
   payload: unknown,
-  qos: mqtt.QoS = mqtt.QoS.AtLeastOnce
+  qos: QoS = 1
 ): Promise<void> {
   const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {});
-  await connection.publish(topic, text, qos);
+  await Promise.resolve(connection.publish(topic, text, qos) as any);
 }
 
 export async function sendInstallationRequest(
-  connection: mqtt.MqttClientConnection,
+  connection: MqttLikeConnection,
   installationId: string,
   clientId: string,
   body: unknown

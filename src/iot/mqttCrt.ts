@@ -1,4 +1,5 @@
-import { mqtt, iot, io, auth } from 'aws-iot-device-sdk-v2';
+// Dynamic CRT transport: import aws-iot-device-sdk-v2 only when actually used,
+// because some runtimes (e.g., Homey) cannot load the native aws-crt binary.
 
 export type CrtConnectParams = {
   endpoint: string; // a24t7r3f2r1nrr-ats.iot.eu-central-1.amazonaws.com
@@ -11,9 +12,18 @@ export type CrtConnectParams = {
   };
 };
 
-export async function connectAwsIotCrt(params: CrtConnectParams): Promise<mqtt.MqttClientConnection> {
-  const { endpoint, region, clientId, credentials } = params;
+export async function connectAwsIotCrt(params: CrtConnectParams): Promise<any> {
+  // Lazily import CRT to avoid crashing environments without native binary
+  let mqtt: any, iot: any, io: any, auth: any;
+  try {
+    const mod: any = await import('aws-iot-device-sdk-v2');
+    mqtt = mod.mqtt; iot = mod.iot; io = mod.io; auth = mod.auth;
+  } catch (e: any) {
+    const msg = e?.message || String(e);
+    throw new Error(`AWS CRT not available: ${msg}`);
+  }
 
+  const { endpoint, region, clientId, credentials } = params;
   const host = new URL(endpoint).host; // normalize
 
   const credentialsProvider = auth.AwsCredentialsProvider.newStatic(
