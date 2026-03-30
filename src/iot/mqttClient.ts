@@ -18,9 +18,8 @@ export async function connectAwsIot(params: ConnectParams): Promise<MqttClient> 
     endpoint,
     region,
     credentials,
-    // Always omit X-Amz-ClientId for parity with the website
-    clientId: undefined,
-    expiresIn: 900,
+    // X-Amz-Expires omitted — Amplify AWSIoTProvider never passes expiration for IoT
+    // X-Amz-ClientId not in URL — goes only to MQTT client constructor
   });
 
   // Redact signature for debug

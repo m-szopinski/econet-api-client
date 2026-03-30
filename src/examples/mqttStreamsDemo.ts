@@ -13,6 +13,7 @@ async function run() {
     appBaseUrl: process.env.AWS_API_ENDPOINT!,
     econetBaseUrl: process.env.ECONET_API_ENDPOINT!,
     siteBaseUrl: process.env.ECONET_SITE,
+    debug: true,
   });
 
   // Fetch installations and pick the first

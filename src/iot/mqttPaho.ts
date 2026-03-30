@@ -7,7 +7,7 @@ type ConnectParams = {
   region: string;
   clientId: string;
   credentials: AwsCredentials;
-  origin?: string; // optional Origin header for Node ws
+  origin?: string;  // optional Origin header for Node ws
 };
 
 export async function connectAwsIotPaho(params: ConnectParams): Promise<MqttLikeConnection> {
@@ -52,7 +52,9 @@ export async function connectAwsIotPaho(params: ConnectParams): Promise<MqttLike
   const mod = (paho as any)?.default ? (paho as any).default : (paho as any);
   const { Client, Message } = mod as any;
 
-  const url = await createPresignedUrl({ endpoint, region, credentials, clientId, expiresIn: 900 });
+  // X-Amz-ClientId is NOT in the URL — it goes only to the Paho constructor (matches Amplify AWSIoTProvider).
+  // X-Amz-Expires is omitted entirely (Amplify signUrl for IoT doesn't pass expiration).
+  const url = await createPresignedUrl({ endpoint, region, credentials });
 
   const client = new Client(url, clientId);
 
@@ -77,7 +79,7 @@ export async function connectAwsIotPaho(params: ConnectParams): Promise<MqttLike
     client.connect({
       useSSL: true,
       cleanSession: true,
-      mqttVersion: 4,
+      mqttVersion: 3,  // Amplify AWSIoTProvider uses mqttVersion:3 (MQTT 3.1)
       keepAliveInterval: 60,
       timeout: 15,
       onSuccess: () => resolve(),

@@ -2,7 +2,6 @@ import { createApiClients, ApiClients } from '../services/api.js';
 import { loginWithCognitoSRP } from '../services/cognitoLogin.js';
 import { getCognitoIdentityCredentials } from '../services/cognitoIdentity.js';
 import { createSigv4Fetcher } from '../services/sigv4Fetch.js';
-import { connectAwsIotCrt } from '../iot/mqttCrt.js';
 import { installationNotifications$ as streamInstallationNotifications$, installationResponse$ as streamInstallationResponse$, TopicMessage, sendInstallationRequest as publishInstallationRequest } from '../iot/streams.js';
 import type { MqttLikeConnection } from '../iot/streams.js';
 import { buildPahoConnectionInfo, type PahoConnectionInfo } from '../iot/pahoInfo.js';
@@ -53,7 +52,7 @@ export type EcoNetAPIClient = {
   ) => Promise<Array<{ key: string; title: string; unit?: string }>>;
   getProfile: ApiClients['app']['getProfile'];
   postRegisteredDataValues: ApiClients['econet']['postRegisteredDataValues'];
-  /** Compute Paho WebSocket connection info (presigned URL, host, clientId) without attempting CRT. */
+  /** Returns MQTT WebSocket connection info (SigV4 presigned URL, host, clientId) for diagnostics. Use presignedUrlRedacted for logging. */
   getPahoConnectionInfo: (clientIdOverride?: string, expiresInSeconds?: number) => Promise<PahoConnectionInfo>;
   installationNotifications$: (installationId: string, opts?: MqttStreamOptions) => Observable<TopicMessage>;
   installationResponse$: (installationId: string, clientId?: string, opts?: MqttStreamOptions) => Observable<TopicMessage>;
@@ -191,45 +190,23 @@ export class EcoNetClient {
   }
 
   private async _connectMqttInternal(): Promise<{ connection: MqttLikeConnection; clientId: string }> {
-    // Compute clientId and presigned URL upfront so both CRT and Paho share the same clientId
-    const pahoInfo = await this.getPahoConnectionInfo(undefined, 900);
+    const pahoInfo = await this.getPahoConnectionInfo();
     const clientId = pahoInfo.clientId;
-    try {
-      const crt = await connectAwsIotCrt({
-        endpoint: this.iotEndpoint,
-        region: this.region,
-        clientId,
-        credentials: this.awsCredentials,
-      });
-      const wrapper: MqttLikeConnection = {
-        async subscribe(topic: string, qos: number, handler: (t: string, p: ArrayBuffer | Buffer) => void) {
-          await crt.subscribe(topic, qos as any, (t: string, payload: ArrayBuffer) => handler(t, Buffer.from(payload as any)));
-        },
-        async unsubscribe(topic: string) { await crt.unsubscribe(topic); },
-        async publish(topic: string, payload: string, qos: number) { await crt.publish(topic, payload, qos as any, false); },
-      };
-      if (this.debug) console.log('[MQTT] using CRT transport');
-      return { connection: wrapper, clientId };
-    } catch (e: any) {
-      const reason = e?.message || e?.name || String(e);
-      console.warn('[MQTT] CRT unavailable, falling back to Paho:', reason);
-      const pahoMod: any = await import('../iot/mqttPaho.js');
-      const connection: MqttLikeConnection = await pahoMod.connectAwsIotPaho({
-        endpoint: this.iotEndpoint,
-        region: this.region,
-        clientId,
-        credentials: this.awsCredentials,
-        origin: pahoInfo.recommended.origin,
-      });
-      if (this.debug) console.log('[MQTT] using Paho transport (fallback)');
-      return { connection, clientId };
-    }
+    const pahoMod: any = await import('../iot/mqttPaho.js');
+    const connection: MqttLikeConnection = await pahoMod.connectAwsIotPaho({
+      endpoint: this.iotEndpoint,
+      region: this.region,
+      clientId,
+      credentials: this.awsCredentials,
+      origin: pahoInfo.recommended.origin,
+    });
+    if (this.debug) console.log('[MQTT] connected via Paho');
+    return { connection, clientId };
   }
 
   /**
-   * Compute Paho-compatible connection info (host, presigned WSS URL, clientId) using current credentials,
-   * without touching the CRT. Safe to call for diagnostics/logging. The URL contains sensitive parameters —
-   * use the redacted version for logs.
+   * Returns MQTT WebSocket connection info (SigV4 presigned URL, host, clientId).
+   * Safe to call for diagnostics/logging — use presignedUrlRedacted for logs.
    */
   getPahoConnectionInfo = async (
     clientIdOverride?: string,
