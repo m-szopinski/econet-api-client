@@ -18,8 +18,7 @@ export async function createPresignedUrl(params: {
   const expiresIn = params.expiresIn ?? 900;
   const service = 'iotdevicegateway';
 
-  const url = new URL(endpoint);
-  const host = url.host;
+  const host = new URL(endpoint).host;
   const path = '/mqtt';
 
   const signer = new SignatureV4({
@@ -38,14 +37,11 @@ export async function createPresignedUrl(params: {
     path,
     headers: { host },
     query: {
-      'X-Amz-Expires': String(expiresIn),
       ...(clientId ? { 'X-Amz-ClientId': clientId } : {}),
     } as Record<string, string>,
   } as any;
 
-  // The signer will add X-Amz-Algorithm, X-Amz-Credential, X-Amz-Date,
-  // X-Amz-SignedHeaders, and X-Amz-Security-Token when credentials include it.
-  const signed = await signer.presign(request);
+  const signed = await signer.presign(request, { expiresIn });
   const q = new URLSearchParams((signed as any).query || {}).toString();
   return `wss://${host}${path}?${q}`;
 }

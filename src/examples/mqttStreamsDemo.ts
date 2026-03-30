@@ -29,8 +29,18 @@ async function run() {
     console.log(label, msg.topic, typeof payload === 'string' ? payload : JSON.stringify(payload));
   };
 
-  const notifSub = client.installationNotifications$(installationId).subscribe(logMsg('[notifications]'));
-  const respSub = client.installationResponse$(installationId).subscribe(logMsg('[response]'));
+  const onStreamError = (label: string) => (err: any) => {
+    console.warn(`${label} stream error (MQTT may be unavailable): ${err?.message ?? err}`);
+  };
+
+  const notifSub = client.installationNotifications$(installationId).subscribe({
+    next: logMsg('[notifications]'),
+    error: onStreamError('[notifications]'),
+  });
+  const respSub = client.installationResponse$(installationId).subscribe({
+    next: logMsg('[response]'),
+    error: onStreamError('[response]'),
+  });
 
   // Request all known parameters for the installation with library defaults
   try {
