@@ -30,8 +30,8 @@ export type EcoNetInit = {
   clientId: string;
   identityPoolId: string;
   iotEndpoint: string; // wss://.../mqtt
-  appBaseUrl: string;
-  econetBaseUrl: string;
+  appBaseUrl: string;   // App API Gateway V2 base URL – IAM-signed (SigV4) + requires appid header
+  econetBaseUrl: string; // econetcloud REST base URL – authenticated with Bearer idToken
   siteBaseUrl?: string;
   debug?: boolean; // enable debug logging (e.g., profile URL tracing)
   fetcher?: (input: RequestInfo, init?: RequestInit) => Promise<Response>;
@@ -101,7 +101,9 @@ export class EcoNetClient {
   private mqttConnPromise: Promise<{ connection: MqttLikeConnection; clientId: string }> | null = null;
   private labelsCache = new Map<string, Record<string, { title: string; unit?: string }>>();
   private awsCredentials!: { accessKeyId: string; secretAccessKey: string; sessionToken?: string };
+  private identityId?: string;
   private iotEndpoint!: string;
+  private siteBaseUrl?: string;
   private defaultChunkSize = 100;
 
   accessToken!: string;
@@ -120,7 +122,7 @@ export class EcoNetClient {
         if (!process.env.AWS_SDK_LOAD_CONFIG) process.env.AWS_SDK_LOAD_CONFIG = '0';
       } catch {}
     }
-    const { username, password, region, userPoolId, clientId, identityPoolId, iotEndpoint, appBaseUrl, econetBaseUrl, siteBaseUrl, debug } = init;
+    const { username, password, region, userPoolId, clientId, identityPoolId, iotEndpoint, appBaseUrl, econetBaseUrl, siteBaseUrl, debug, fetcher, defaultValuesChunkSize } = init;
     if (!username) throw new Error('username is required');
     if (!password) throw new Error('password is required');
     if (!region) throw new Error('region is required');
@@ -133,8 +135,9 @@ export class EcoNetClient {
     self.region = region;
     self.debug = !!debug;
     self.iotEndpoint = iotEndpoint;
-    if (Number.isFinite(init.defaultValuesChunkSize as number) && (init.defaultValuesChunkSize as number) > 0) {
-      self.defaultChunkSize = Math.trunc(init.defaultValuesChunkSize as number);
+    self.siteBaseUrl = siteBaseUrl;
+    if (Number.isFinite(defaultValuesChunkSize as number) && (defaultValuesChunkSize as number) > 0) {
+      self.defaultChunkSize = Math.trunc(defaultValuesChunkSize as number);
     }
 
     const tokens = await loginWithCognitoSRP({ username, password, userPoolId, clientId, region: self.region });
@@ -152,98 +155,75 @@ export class EcoNetClient {
       secretAccessKey: identity.credentials.SecretKey,
       sessionToken: identity.credentials.SessionToken,
     };
+    self.identityId = identity.identityId;
 
     self.appBaseUrl = appBaseUrl;
     const appBaseHost = new URL(self.appBaseUrl).hostname;
 
+    // App API (V2 endpoint) uses SigV4 IAM auth via Cognito Identity credentials.
+    // The 'appid' header is required by the API Gateway Lambda (mirrors Amplify custom_header).
     const sigv4Fetcher = createSigv4Fetcher({
       region: self.region,
       service: 'execute-api',
-      credentials: {
-        accessKeyId: identity.credentials.AccessKeyId,
-        secretAccessKey: identity.credentials.SecretKey,
-        sessionToken: identity.credentials.SessionToken,
-      },
+      credentials: self.awsCredentials,
       signHosts: [appBaseHost],
     });
 
     self.api = createApiClients({
-      fetcher: init?.fetcher ?? sigv4Fetcher,
+      fetcher: fetcher ?? sigv4Fetcher,
       appBaseUrl: self.appBaseUrl,
       econetBaseUrl,
       siteBaseUrl,
-      defaultHeaders: () => ({ Authorization: `Bearer ${tokens.idToken}` }),
+      defaultHeaders: () => ({ appid: '0' }),
     });
     self.raw = self.api;
 
     return self;
   }
 
-  private async ensureMqtt(): Promise<{ connection: MqttLikeConnection; clientId: string }> {
+  /** Returns (and caches) the shared MQTT connection promise. Non-async so the assignment is synchronous,
+   *  preventing a race condition when multiple callers subscribe concurrently. */
+  private ensureMqtt(): Promise<{ connection: MqttLikeConnection; clientId: string }> {
     if (!this.mqttConnPromise) {
-      // Compute the clientId and presigned URL upfront so both CRT and Paho share the same clientId
-      const prelim = await this.getPahoConnectionInfo(undefined, 900);
-      const clientId = prelim.clientId;
-      // Node/Homey default: CRT first, then automatic fallback to Paho (no control params)
-      const loadPaho = async (): Promise<any> => {
-        const inSrc = /\/(src|source)\//.test(import.meta.url);
-        const primary = inSrc ? '../iot/mqttPaho.ts' : '../iot/mqttPaho.js';
-        const fallback = inSrc ? '../iot/mqttPaho.js' : '../iot/mqttPaho.ts';
-        const tryImport = async (spec: string) => {
-          try {
-            const resolver: any = (import.meta as any).resolve;
-            const resolved = typeof resolver === 'function' ? await resolver(spec) : spec;
-            return await import(resolved);
-          } catch (e) {
-            return await import(spec); // final attempt without resolve
-          }
-        };
-        try {
-          return await tryImport(primary);
-        } catch (e1) {
-          try {
-            return await tryImport(fallback);
-          } catch (e2: any) {
-            const msg = e2?.message || (e1 as any)?.message || String(e2 || e1);
-            throw new Error(`Cannot resolve mqttPaho module: ${msg}`);
-          }
-        }
-      };
-      this.mqttConnPromise = (async () => {
-        try {
-          const crt = await connectAwsIotCrt({
-            endpoint: this.iotEndpoint,
-            region: this.region,
-            clientId,
-            credentials: this.awsCredentials,
-          });
-          const wrapper: MqttLikeConnection = {
-            async subscribe(topic: string, qos: number, handler: (t: string, p: ArrayBuffer | Buffer) => void) {
-              await crt.subscribe(topic, qos as any, (t: string, payload: ArrayBuffer) => handler(t, Buffer.from(payload as any)));
-            },
-            async unsubscribe(topic: string) { await crt.unsubscribe(topic); },
-            async publish(topic: string, payload: string, qos: number) { await crt.publish(topic, payload, qos as any, false); },
-          };
-          if (this.debug) console.log('[MQTT] using CRT transport');
-          return { connection: wrapper, clientId };
-        } catch (e: any) {
-          const reason = e?.message || e?.name || String(e);
-          console.warn('[MQTT] CRT unavailable, falling back to Paho:', reason);
-          const pahoMod: any = await loadPaho();
-          const info = await this.getPahoConnectionInfo(clientId, 900);
-          const connection: MqttLikeConnection = await pahoMod.connectAwsIotPaho({
-            endpoint: this.iotEndpoint,
-            region: this.region,
-            clientId,
-            credentials: this.awsCredentials,
-            origin: info.recommended.origin,
-          });
-          if (this.debug) console.log('[MQTT] using Paho transport (fallback)');
-          return { connection, clientId };
-        }
-      })();
+      this.mqttConnPromise = this._connectMqttInternal();
     }
-    return this.mqttConnPromise!;
+    return this.mqttConnPromise;
+  }
+
+  private async _connectMqttInternal(): Promise<{ connection: MqttLikeConnection; clientId: string }> {
+    // Compute clientId and presigned URL upfront so both CRT and Paho share the same clientId
+    const pahoInfo = await this.getPahoConnectionInfo(undefined, 900);
+    const clientId = pahoInfo.clientId;
+    try {
+      const crt = await connectAwsIotCrt({
+        endpoint: this.iotEndpoint,
+        region: this.region,
+        clientId,
+        credentials: this.awsCredentials,
+      });
+      const wrapper: MqttLikeConnection = {
+        async subscribe(topic: string, qos: number, handler: (t: string, p: ArrayBuffer | Buffer) => void) {
+          await crt.subscribe(topic, qos as any, (t: string, payload: ArrayBuffer) => handler(t, Buffer.from(payload as any)));
+        },
+        async unsubscribe(topic: string) { await crt.unsubscribe(topic); },
+        async publish(topic: string, payload: string, qos: number) { await crt.publish(topic, payload, qos as any, false); },
+      };
+      if (this.debug) console.log('[MQTT] using CRT transport');
+      return { connection: wrapper, clientId };
+    } catch (e: any) {
+      const reason = e?.message || e?.name || String(e);
+      console.warn('[MQTT] CRT unavailable, falling back to Paho:', reason);
+      const pahoMod: any = await import('../iot/mqttPaho.js');
+      const connection: MqttLikeConnection = await pahoMod.connectAwsIotPaho({
+        endpoint: this.iotEndpoint,
+        region: this.region,
+        clientId,
+        credentials: this.awsCredentials,
+        origin: pahoInfo.recommended.origin,
+      });
+      if (this.debug) console.log('[MQTT] using Paho transport (fallback)');
+      return { connection, clientId };
+    }
   }
 
   /**
@@ -255,14 +235,14 @@ export class EcoNetClient {
     clientIdOverride?: string,
     expiresInSeconds = 900
   ): Promise<PahoConnectionInfo> => {
-    const clientId = clientIdOverride ?? generateClientId(this.region);
+    const clientId = clientIdOverride ?? generateClientId(this.region, this.identityId);
     const info = await buildPahoConnectionInfo({
       endpoint: this.iotEndpoint,
       region: this.region,
       credentials: this.awsCredentials,
       clientId,
       expiresIn: expiresInSeconds,
-      origin: 'https://econetcloud.eu',
+      origin: this.siteBaseUrl,
     });
     if (this.debug) {
       // eslint-disable-next-line no-console
@@ -332,17 +312,16 @@ export class EcoNetClient {
     const profiles: ProfileJson[] = [];
     let lastErr: any = null;
     for (const a of plan) {
-      const url = `${this.appBaseUrl}/profiles/${encodeURIComponent(String(a.producerCode))}/${encodeURIComponent(a.deviceName)}/${encodeURIComponent(a.firmware)}/${encodeURIComponent(a.schema)}/web/profile.json`;
-      if (this.debug) console.log('[profile:url] try', url);
+      if (this.debug) console.log('[profile] try', `${a.producerCode}/${a.deviceName}/${a.firmware}/${a.schema}`);
       try {
         const p = await this.api.app.getProfile(a);
-        if (this.debug) console.log('[profile:url] ok ', url);
+        if (this.debug) console.log('[profile] ok ', `${a.producerCode}/${a.deviceName}/${a.firmware}/${a.schema}`);
         profiles.push(p);
       } catch (e) {
         lastErr = e;
         const msg = (e as Error)?.message ?? '';
-        if (/404/i.test(msg)) { if (this.debug) console.log('[profile:url] 404', url); continue; }
-        if (this.debug) console.log('[profile:url] err', url, msg);
+        if (/404/i.test(msg)) { if (this.debug) console.log('[profile] 404', `${a.producerCode}/${a.deviceName}/${a.firmware}/${a.schema}`); continue; }
+        if (this.debug) console.log('[profile] err', `${a.producerCode}/${a.deviceName}/${a.firmware}/${a.schema}`, msg);
         throw e;
       }
     }
@@ -458,7 +437,7 @@ export class EcoNetClient {
     }
     if (!component) throw new Error('Cannot determine componentId to request values for');
 
-  const chunkSize = Math.max(1, Math.trunc(opts?.chunkSize ?? this.defaultChunkSize));
+    const chunkSize = Math.max(1, Math.trunc(opts?.chunkSize ?? this.defaultChunkSize));
     let tx = Math.trunc(opts?.transactionStart ?? 1000);
     for (let i = 0; i < keys.length; i += chunkSize) {
       const chunk = keys.slice(i, i + chunkSize);
@@ -522,7 +501,7 @@ export class EcoNetClient {
       try {
         const details = await this.getInstallationDetails(installationId);
         const first = (details.components || []).find((c: any) => !!c?.componentFn);
-        component = (first?.componentFn as string | undefined) ?? undefined;
+        component = first?.componentFn as string | undefined;
       } catch {}
     }
     const params = opts?.parameters ?? ['u6342', 'u6338', 'u81'];
@@ -535,3 +514,4 @@ export class EcoNetClient {
 export async function EcoNetAPIClient(init: EcoNetInit): Promise<EcoNetAPIClient> {
   return EcoNetClient.create(init);
 }
+

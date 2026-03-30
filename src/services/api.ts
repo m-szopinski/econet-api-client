@@ -33,23 +33,44 @@ export type InstallationDetailsResponse = {
     typeId?: number;
     protocol?: string;
     customName?: string;
+    fullAddress?: string;
+    place?: string;
+    timezone?: string;
+    coordinates?: { lat?: number; long?: number };
     update?: { version?: string; location?: string };
     weatherEnabled?: number;
-    energyTariffStatus?: number;
+    energyTariffStatus?: Record<string, unknown>;
     electricityTariffDetails?: Record<string, unknown>;
+    owner?: string;
+    invitation?: string;
+    serviceId?: string;
+    iconId?: string | null;
   };
   components?: Array<{
     installationId?: string;
+    /** Component function / serial number – used as MQTT component identifier */
     componentFn?: string;
-    isHidden?: boolean;
-    typeId?: number;
     componentType?: string;
+    typeId?: number;
+    isHidden?: boolean;
     softVersion?: string;
+    hardwareVersion?: string;
     producerName?: string;
     producerCode?: number;
-    hardwareVersion?: string;
     protocol?: string;
     hasRadioModule?: boolean;
+    customName?: string;
+    ufn?: string | null;
+    parentUfn?: string | null;
+    modbusAddress?: number | null;
+    port?: number | null;
+    iconId?: string | null;
+    devCategory?: number | null;
+    update?: { version?: string; location?: string } | null;
+  }>;
+  invalidComponents?: Array<{
+    status?: number;
+    componentFn?: string;
   }>;
 };
 
@@ -59,6 +80,8 @@ export type RegisteredDataValuesRequest = {
     factoryNumber?: string;
     parameters?: string[];
   }>;
+  /** When true, returns raw (non-downsampled) data. */
+  rawData?: boolean;
 };
 
 export type RegisteredDataValuesResponse = {
@@ -235,7 +258,7 @@ export function createApiClients(config?: {
   fetcher?: Fetcher;
   appBaseUrl?: string;
   econetBaseUrl?: string;
-  siteBaseUrl?: string; // optional, reserved for future use
+  siteBaseUrl?: string; // optional; when provided, profile/translation requests use this base instead of appBaseUrl
   defaultHeaders?: AuthHeadersProvider; // e.g., supply Authorization headers
 }): ApiClients {
   const fetcher = config?.fetcher ?? defaultFetcher;
@@ -243,7 +266,7 @@ export function createApiClients(config?: {
   if (!config?.econetBaseUrl) throw new Error('createApiClients requires econetBaseUrl');
   const appBase = config.appBaseUrl;
   const econetBase = config.econetBaseUrl;
-  const _siteBase = config.siteBaseUrl; // not used yet, but accepted for completeness
+  const profileBase = config.siteBaseUrl ?? appBase;
   const defaultHeadersProvider = config?.defaultHeaders;
 
   // helper to merge default headers
@@ -260,16 +283,16 @@ export function createApiClients(config?: {
       /** Returns notification summary for current user. */
       async getNotifications(opts) {
         const headers = await withDefaultHeaders(opts?.headers);
-        const res = await fetcher(`${appBase}/user-get-notifications`, { method: 'GET', headers });
-        if (!res.ok) throw new Error(`GET /user-get-notifications failed: ${res.status} ${res.statusText}`);
+        const res = await fetcher(`${appBase}/v1/user/get-notifications`, { method: 'GET', headers });
+        if (!res.ok) throw new Error(`GET /v1/user/get-notifications failed: ${res.status} ${res.statusText}`);
         return res.json() as Promise<UserNotificationsResponse>;
       },
 
       /** Returns installations available for the current user. */
       async getInstallations(opts) {
         const headers = await withDefaultHeaders(opts?.headers);
-        const res = await fetcher(`${appBase}/get-installations`, { method: 'GET', headers });
-        if (!res.ok) throw new Error(`GET /get-installations failed: ${res.status} ${res.statusText}`);
+        const res = await fetcher(`${appBase}/v1/get-installation-list`, { method: 'GET', headers });
+        if (!res.ok) throw new Error(`GET /v1/get-installation-list failed: ${res.status} ${res.statusText}`);
         return res.json() as Promise<GetInstallationsResponse>;
       },
 
@@ -277,9 +300,9 @@ export function createApiClients(config?: {
       async getInstallationDetails(installationId: string, opts) {
         if (!installationId) throw new Error("installationId is required");
         const headers = await withDefaultHeaders(opts?.headers);
-        const url = `${appBase}/get-installation-details-V2/${encodeURIComponent(installationId)}`;
+        const url = `${appBase}/v1/installation/${encodeURIComponent(installationId)}/get-details`;
         const res = await fetcher(url, { method: 'GET', headers });
-        if (!res.ok) throw new Error(`GET /get-installation-details-V2/{id} failed: ${res.status} ${res.statusText}`);
+        if (!res.ok) throw new Error(`GET /v1/installation/{id}/get-details failed: ${res.status} ${res.statusText}`);
         return res.json() as Promise<InstallationDetailsResponse>;
       },
 
@@ -293,7 +316,7 @@ export function createApiClients(config?: {
         if (!firmware) throw new Error("firmware is required");
         if (!schema) throw new Error("schema is required");
         const headers = await withDefaultHeaders(opts?.headers);
-        const url = `${appBase}/profiles/${encodeURIComponent(String(producerCode))}/${encodeURIComponent(deviceName)}/${encodeURIComponent(firmware)}/${encodeURIComponent(schema)}/web/profile.json`;
+        const url = `${profileBase}/profiles/${encodeURIComponent(String(producerCode))}/${encodeURIComponent(deviceName)}/${encodeURIComponent(firmware)}/${encodeURIComponent(schema)}/web/profile.json`;
         const res = await fetcher(url, { method: 'GET', headers });
         if (!res.ok) throw new Error(`GET /profiles/{producer}/{name}/{fw}/{schema}/web/profile.json failed: ${res.status} ${res.statusText}`);
         return res.json() as Promise<ProfileJson>;
@@ -310,7 +333,7 @@ export function createApiClients(config?: {
         if (!schema) throw new Error("schema is required");
         if (!lang) throw new Error("lang is required");
         const headers = await withDefaultHeaders(opts?.headers);
-        const url = `${appBase}/profiles/${encodeURIComponent(String(producerCode))}/${encodeURIComponent(deviceName)}/${encodeURIComponent(firmware)}/${encodeURIComponent(schema)}/web/trans_${encodeURIComponent(lang)}.json`;
+        const url = `${profileBase}/profiles/${encodeURIComponent(String(producerCode))}/${encodeURIComponent(deviceName)}/${encodeURIComponent(firmware)}/${encodeURIComponent(schema)}/web/trans_${encodeURIComponent(lang)}.json`;
         const res = await fetcher(url, { method: 'GET', headers });
         if (!res.ok) throw new Error(`GET /profiles/{producer}/{name}/{fw}/{schema}/web/trans_${lang}.json failed: ${res.status} ${res.statusText}`);
         return res.json() as Promise<TranslationsJson>;
@@ -322,13 +345,13 @@ export function createApiClients(config?: {
       async postRegisteredDataValues(installationId: string, body: RegisteredDataValuesRequest, opts) {
         if (!installationId) throw new Error("installationId is required");
         const headers = await withDefaultHeaders(opts?.headers);
-        const url = `${econetBase}/api/v2/registereddata/values/${encodeURIComponent(installationId)}`;
+        const url = `${econetBase}/v2/registereddata/values/${encodeURIComponent(installationId)}`;
         const res = await fetcher(url, {
           method: 'POST',
           headers: { 'content-type': 'application/json', ...(headers ?? {}) },
           body: JSON.stringify(body ?? {}),
         });
-        if (!res.ok) throw new Error(`POST /api/v2/registereddata/values/{id} failed: ${res.status} ${res.statusText}`);
+        if (!res.ok) throw new Error(`POST /v2/registereddata/values/{id} failed: ${res.status} ${res.statusText}`);
         return res.json() as Promise<RegisteredDataValuesResponse>;
       },
     },

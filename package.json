@@ -1,6 +1,6 @@
 {
   "name": "econet-api-client",
-  "version": "1.0.1",
+  "version": "1.0.3",
   "description": "EcoNet API Client for TypeScript: Cognito SRP auth, SigV4 REST, AWS IoT MQTT streams, and profile-based labels.",
   "type": "module",
   "main": "./dist/index.js",
@@ -36,13 +36,11 @@
     "sigv4"
   ],
   "scripts": {
-    
     "dev:client": "tsx watch src/examples/clientDemo.ts",
-  "dev:mqtt": "tsx watch src/examples/mqttStreamsDemo.ts",
-  "demo:once": "tsx src/examples/clientDemo.ts",
-  "demo:mqtt:once": "tsx src/examples/mqttStreamsDemo.ts",
-    
-  "build": "rm -rf dist && tsc -p tsconfig.json",
+    "dev:mqtt": "tsx watch src/examples/mqttStreamsDemo.ts",
+    "demo:once": "tsx src/examples/clientDemo.ts",
+    "demo:mqtt:once": "tsx src/examples/mqttStreamsDemo.ts",
+    "build": "rm -rf dist && tsc -p tsconfig.json",
     "prepublishOnly": "npm run -s build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -60,14 +58,15 @@
     "@aws-crypto/sha256-js": "^5.2.0",
     "@aws-sdk/client-cognito-identity": "^3.679.0",
     "@aws-sdk/client-cognito-identity-provider": "^3.679.0",
-  "@aws-sdk/protocol-http": "^3.370.0",
-    "@aws-sdk/hash-node": "^3.370.0",
+    "@aws-sdk/protocol-http": "^3.370.0",
     "@aws-sdk/signature-v4": "^3.370.0",
     "amazon-cognito-identity-js": "^6.3.13",
-    "aws-iot-device-sdk-v2": "^1.23.1",
     "paho-mqtt": "^1.1.0",
     "ws": "^8.18.0",
     "rxjs": "^7.8.1",
     "uuid": "^13.0.0"
+  },
+  "optionalDependencies": {
+    "aws-iot-device-sdk-v2": "^1.23.1"
   }
 }
