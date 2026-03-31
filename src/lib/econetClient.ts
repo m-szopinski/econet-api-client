@@ -53,7 +53,7 @@ export type EcoNetAPIClient = {
   getProfile: ApiClients['app']['getProfile'];
   postRegisteredDataValues: ApiClients['econet']['postRegisteredDataValues'];
   /** Returns MQTT WebSocket connection info (SigV4 presigned URL, host, clientId) for diagnostics. Use presignedUrlRedacted for logging. */
-  getPahoConnectionInfo: (clientIdOverride?: string, expiresInSeconds?: number) => Promise<PahoConnectionInfo>;
+  getPahoConnectionInfo: (clientIdOverride?: string) => Promise<PahoConnectionInfo>;
   installationNotifications$: (installationId: string, opts?: MqttStreamOptions) => Observable<TopicMessage>;
   installationResponse$: (installationId: string, clientId?: string, opts?: MqttStreamOptions) => Observable<TopicMessage>;
   sendInstallationRequest: (installationId: string, body: unknown, clientIdOverride?: string) => Promise<void>;
@@ -208,17 +208,13 @@ export class EcoNetClient {
    * Returns MQTT WebSocket connection info (SigV4 presigned URL, host, clientId).
    * Safe to call for diagnostics/logging — use presignedUrlRedacted for logs.
    */
-  getPahoConnectionInfo = async (
-    clientIdOverride?: string,
-    expiresInSeconds = 900
-  ): Promise<PahoConnectionInfo> => {
+  getPahoConnectionInfo = async (clientIdOverride?: string): Promise<PahoConnectionInfo> => {
     const clientId = clientIdOverride ?? generateClientId(this.region, this.identityId);
-    const info = await buildPahoConnectionInfo({
+    const info = buildPahoConnectionInfo({
       endpoint: this.iotEndpoint,
       region: this.region,
       credentials: this.awsCredentials,
       clientId,
-      expiresIn: expiresInSeconds,
       origin: this.siteBaseUrl,
     });
     if (this.debug) {

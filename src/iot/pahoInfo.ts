@@ -6,27 +6,24 @@ export type PahoConnectionInfo = {
   host: string;
   region: string;
   clientId: string;
-  presignedUrl: string;         // SigV4 presigned WSS URL (session token unsigned, per Amplify)
-  presignedUrlRedacted: string; // same with sensitive params redacted (safe for logging)
+  presignedUrl: string;
+  presignedUrlRedacted: string;
   recommended: { origin?: string };
 };
 
-export async function buildPahoConnectionInfo(params: {
+export function buildPahoConnectionInfo(params: {
   endpoint: string;
   region: string;
   credentials: AwsCredentials;
   clientId: string;
-  expiresIn?: number;
   origin?: string;
-}): Promise<PahoConnectionInfo> {
+}): PahoConnectionInfo {
   const { hostname: host } = new URL(params.endpoint);
 
-  const presignedUrl = await createPresignedUrl({
+  const presignedUrl = createPresignedUrl({
     endpoint: params.endpoint,
     region: params.region,
     credentials: params.credentials,
-    // X-Amz-Expires omitted — Amplify AWSIoTProvider never passes expiration for IoT
-    // X-Amz-ClientId NOT in URL — goes only to Paho constructor
   });
 
   const presignedUrlRedacted = presignedUrl
