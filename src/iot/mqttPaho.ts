@@ -24,7 +24,7 @@ export async function connectAwsIotPaho(params: ConnectParams): Promise<MqttLike
       }
     };
   } catch {
-    // Node >= 22 exposes a native WebSocket — no polyfill needed.
+    // ws not available — rely on whatever WebSocket is already in globalThis.
   }
 
   // Import Paho (ESM default export contains Client/Message)

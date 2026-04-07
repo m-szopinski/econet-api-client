@@ -2,7 +2,12 @@ import { createApiClients, ApiClients } from '../services/api.js';
 import { loginWithCognitoSRP } from '../services/cognitoLogin.js';
 import { getCognitoIdentityCredentials } from '../services/cognitoIdentity.js';
 import { createSigv4Fetcher } from '../services/sigv4Fetch.js';
-import { installationNotifications$ as streamInstallationNotifications$, installationResponse$ as streamInstallationResponse$, TopicMessage, sendInstallationRequest as publishInstallationRequest } from '../iot/streams.js';
+import {
+  installationNotifications$ as streamNotifications$,
+  installationResponse$ as streamResponse$,
+  sendInstallationRequest as publishRequest,
+  TopicMessage,
+} from '../iot/streams.js';
 import type { MqttLikeConnection } from '../iot/streams.js';
 import { buildPahoConnectionInfo, type PahoConnectionInfo } from '../iot/pahoInfo.js';
 import { defer, switchMap, Observable, map } from 'rxjs';
@@ -16,229 +21,167 @@ export type ProfileSelector = {
   schema?: string;
 };
 
-export type MqttStreamOptions = {
-  profile?: ProfileSelector; // per-installation profile override
-};
+export type MqttStreamOptions = { profile?: ProfileSelector };
 
 export type EcoNetInit = {
-  // All values must be provided by the caller; library code must not read process.env directly.
   username: string;
   password: string;
   region: string;
   userPoolId: string;
   clientId: string;
   identityPoolId: string;
-  iotEndpoint: string; // wss://.../mqtt
-  appBaseUrl: string;   // App API Gateway V2 base URL – IAM-signed (SigV4) + requires appid header
-  econetBaseUrl: string; // econetcloud REST base URL – authenticated with Bearer idToken
+  /** WebSocket MQTT endpoint: wss://xxx-ats.iot.<region>.amazonaws.com/mqtt */
+  iotEndpoint: string;
+  appBaseUrl: string;
+  econetBaseUrl: string;
   siteBaseUrl?: string;
-  debug?: boolean; // enable debug logging (e.g., profile URL tracing)
+  /** Language code for parameter labels, e.g. 'pl', 'en'. Defaults to 'en'. */
+  lang?: string;
+  debug?: boolean;
   fetcher?: (input: RequestInfo, init?: RequestInit) => Promise<Response>;
-  /** Default chunk size for batched GET_VALUES in requestAllValues (fallback 100) */
   defaultValuesChunkSize?: number;
 };
 
 export type EcoNetAPIClient = {
-  getNotifications: ApiClients['app']['getNotifications'];
   getInstallations: ApiClients['app']['getInstallations'];
   getInstallationDetails: ApiClients['app']['getInstallationDetails'];
-  /**
-   * Returns all known parameter descriptors for the installation by inspecting component-derived profiles.
-   * Each entry contains the raw parameter key plus a human title/unit when available.
-   */
-  getInstallationParameters: (
-    installationId: string,
-    opts?: MqttStreamOptions
-  ) => Promise<Array<{ key: string; title: string; unit?: string }>>;
+  getNotifications: ApiClients['app']['getNotifications'];
   getProfile: ApiClients['app']['getProfile'];
+  getTranslations: ApiClients['app']['getTranslations'];
   postRegisteredDataValues: ApiClients['econet']['postRegisteredDataValues'];
-  /** Returns MQTT WebSocket connection info (SigV4 presigned URL, host, clientId) for diagnostics. Use presignedUrlRedacted for logging. */
+  /** Lists all known parameters (key + human label) by loading component profiles + translations. */
+  getInstallationParameters: (id: string, opts?: MqttStreamOptions) => Promise<Array<{ key: string; title: string; unit?: string }>>;
   getPahoConnectionInfo: (clientIdOverride?: string) => Promise<PahoConnectionInfo>;
-  installationNotifications$: (installationId: string, opts?: MqttStreamOptions) => Observable<TopicMessage>;
-  installationResponse$: (installationId: string, clientId?: string, opts?: MqttStreamOptions) => Observable<TopicMessage>;
-  sendInstallationRequest: (installationId: string, body: unknown, clientIdOverride?: string) => Promise<void>;
-  requestComponentsOnBus: (installationId: string, transactionId?: string, clientIdOverride?: string) => Promise<void>;
-  requestValues: (
-    installationId: string,
-    componentId: string,
-    parameters: string[],
-    transactionId?: string,
-    clientIdOverride?: string
-  ) => Promise<void>;
-  /**
-   * Convenience orchestration: resolve available parameters via profiles and request their values via MQTT.
-   * Returns the total number of parameters requested.
-   */
-  requestAllValues: (
-    installationId: string,
-    opts?: {
-      componentId?: string;
-      chunkSize?: number; // defaults to 100
-      transactionStart?: number; // defaults to 1000
-      profile?: ProfileSelector;
-      clientIdOverride?: string;
-    }
-  ) => Promise<number>;
-  primeInstallation: (
-    installationId: string,
-    opts?: {
-      componentId?: string;
-      parameters?: string[];
-      transactionIds?: { discover?: string; values?: string };
-      clientIdOverride?: string;
-    }
-  ) => Promise<void>;
+  installationNotifications$: (id: string, opts?: MqttStreamOptions) => Observable<TopicMessage>;
+  installationResponse$: (id: string, clientId?: string, opts?: MqttStreamOptions) => Observable<TopicMessage>;
+  sendInstallationRequest: (id: string, body: unknown, clientIdOverride?: string) => Promise<void>;
+  requestComponentsOnBus: (id: string, transactionId?: string, clientIdOverride?: string) => Promise<void>;
+  requestValues: (id: string, componentId: string, parameters: string[], transactionId?: string, clientIdOverride?: string) => Promise<void>;
+  /** Set parameter values via PARAMS_MODIFICATION. Values must be strings. Status "0"/"16" = accepted. */
+  setValues: (id: string, componentId: string, values: Record<string, string>, transactionId?: string, clientIdOverride?: string) => Promise<void>;
+  requestAllValues: (id: string, opts?: { componentId?: string; chunkSize?: number; transactionStart?: number; profile?: ProfileSelector; clientIdOverride?: string }) => Promise<number>;
   raw: ApiClients;
   accessToken: string;
   idToken: string;
 };
 
+type Labels = Record<string, { title: string; unit?: string }>;
+type Conn = { connection: MqttLikeConnection; clientId: string };
+
+const REQUIRED_FIELDS = ['username', 'password', 'region', 'userPoolId', 'clientId', 'identityPoolId', 'iotEndpoint', 'appBaseUrl', 'econetBaseUrl'] as const;
+
 export class EcoNetClient {
   private region!: string;
-  private appBaseUrl!: string;
   private api!: ApiClients;
-  private mqttConnPromise: Promise<{ connection: MqttLikeConnection; clientId: string }> | null = null;
-  private labelsCache = new Map<string, Record<string, { title: string; unit?: string }>>();
-  private awsCredentials!: { accessKeyId: string; secretAccessKey: string; sessionToken?: string };
+  private mqttConn: Promise<Conn> | null = null;
+  private labelsCache = new Map<string, Labels>();
+  private credentials!: { accessKeyId: string; secretAccessKey: string; sessionToken?: string };
   private identityId?: string;
   private iotEndpoint!: string;
   private siteBaseUrl?: string;
-  private defaultChunkSize = 100;
+  private lang = 'en';
+  private chunkSize = 100;
+  private debug = false;
 
   accessToken!: string;
   idToken!: string;
   raw!: ApiClients;
 
-  private debug = false;
   private constructor() {}
 
   static async create(init: EcoNetInit): Promise<EcoNetClient> {
     const self = new EcoNetClient();
-    // Node-only (Homey) hardening: ensure HOME exists and avoid reading shared AWS config
+
+    // Node/Homey: ensure HOME exists and skip shared AWS config file
     if (typeof window === 'undefined') {
       try {
         if (!process.env.HOME && !process.env.USERPROFILE) process.env.HOME = '/tmp';
-        if (!process.env.AWS_SDK_LOAD_CONFIG) process.env.AWS_SDK_LOAD_CONFIG = '0';
+        process.env.AWS_SDK_LOAD_CONFIG ??= '0';
       } catch {}
     }
-    const { username, password, region, userPoolId, clientId, identityPoolId, iotEndpoint, appBaseUrl, econetBaseUrl, siteBaseUrl, debug, fetcher, defaultValuesChunkSize } = init;
-    if (!username) throw new Error('username is required');
-    if (!password) throw new Error('password is required');
-    if (!region) throw new Error('region is required');
-    if (!userPoolId) throw new Error('userPoolId is required');
-    if (!clientId) throw new Error('clientId is required');
-    if (!identityPoolId) throw new Error('identityPoolId is required');
-    if (!iotEndpoint) throw new Error('iotEndpoint is required');
-    if (!appBaseUrl) throw new Error('appBaseUrl is required');
-    if (!econetBaseUrl) throw new Error('econetBaseUrl is required');
+
+    for (const k of REQUIRED_FIELDS) if (!init[k]) throw new Error(`${k} is required`);
+
+    const { username, password, region, userPoolId, clientId, identityPoolId,
+            iotEndpoint, appBaseUrl, econetBaseUrl, siteBaseUrl, lang, debug, fetcher, defaultValuesChunkSize } = init;
+
     self.region = region;
-    self.debug = !!debug;
     self.iotEndpoint = iotEndpoint;
     self.siteBaseUrl = siteBaseUrl;
-    if (Number.isFinite(defaultValuesChunkSize as number) && (defaultValuesChunkSize as number) > 0) {
-      self.defaultChunkSize = Math.trunc(defaultValuesChunkSize as number);
-    }
+    self.lang = lang ?? 'en';
+    self.debug = !!debug;
+    if (Number.isFinite(defaultValuesChunkSize) && (defaultValuesChunkSize as number) > 0)
+      self.chunkSize = Math.trunc(defaultValuesChunkSize as number);
 
-    const tokens = await loginWithCognitoSRP({ username, password, userPoolId, clientId, region: self.region });
-    self.accessToken = tokens.accessToken;
-    self.idToken = tokens.idToken;
+    const { accessToken, idToken } = await loginWithCognitoSRP({ username, password, userPoolId, clientId, region });
+    self.accessToken = accessToken;
+    self.idToken = idToken;
 
-    const identity = await getCognitoIdentityCredentials({
-      idToken: tokens.idToken,
-      identityPoolId,
-      userPoolId,
-      region: self.region,
-    });
-    self.awsCredentials = {
+    const identity = await getCognitoIdentityCredentials({ idToken, identityPoolId, userPoolId, region });
+    self.credentials = {
       accessKeyId: identity.credentials.AccessKeyId,
       secretAccessKey: identity.credentials.SecretKey,
       sessionToken: identity.credentials.SessionToken,
     };
     self.identityId = identity.identityId;
 
-    self.appBaseUrl = appBaseUrl;
-    const appBaseHost = new URL(self.appBaseUrl).hostname;
-
-    // App API (V2 endpoint) uses SigV4 IAM auth via Cognito Identity credentials.
-    // The 'appid' header is required by the API Gateway Lambda (mirrors Amplify custom_header).
     const sigv4Fetcher = createSigv4Fetcher({
-      region: self.region,
+      region,
       service: 'execute-api',
-      credentials: self.awsCredentials,
-      signHosts: [appBaseHost],
+      credentials: self.credentials,
+      signHosts: [new URL(appBaseUrl).hostname],
     });
 
     self.api = createApiClients({
       fetcher: fetcher ?? sigv4Fetcher,
-      appBaseUrl: self.appBaseUrl,
+      appBaseUrl,
       econetBaseUrl,
       siteBaseUrl,
       defaultHeaders: () => ({ appid: '0' }),
     });
     self.raw = self.api;
-
     return self;
   }
 
-  /** Returns (and caches) the shared MQTT connection promise. Non-async so the assignment is synchronous,
-   *  preventing a race condition when multiple callers subscribe concurrently. */
-  private ensureMqtt(): Promise<{ connection: MqttLikeConnection; clientId: string }> {
-    if (!this.mqttConnPromise) {
-      this.mqttConnPromise = this._connectMqttInternal();
-    }
-    return this.mqttConnPromise;
+  private ensureMqtt(): Promise<Conn> {
+    return (this.mqttConn ??= (async () => {
+      const info = await this.getPahoConnectionInfo();
+      const { connectAwsIotPaho } = await import('../iot/mqttPaho.js') as any;
+      const connection: MqttLikeConnection = await connectAwsIotPaho({
+        endpoint: this.iotEndpoint,
+        region: this.region,
+        clientId: info.clientId,
+        credentials: this.credentials,
+        origin: info.recommended.origin,
+      });
+      if (this.debug) console.log('[MQTT] connected');
+      return { connection, clientId: info.clientId };
+    })());
   }
 
-  private async _connectMqttInternal(): Promise<{ connection: MqttLikeConnection; clientId: string }> {
-    const pahoInfo = await this.getPahoConnectionInfo();
-    const clientId = pahoInfo.clientId;
-    const pahoMod: any = await import('../iot/mqttPaho.js');
-    const connection: MqttLikeConnection = await pahoMod.connectAwsIotPaho({
-      endpoint: this.iotEndpoint,
-      region: this.region,
-      clientId,
-      credentials: this.awsCredentials,
-      origin: pahoInfo.recommended.origin,
-    });
-    if (this.debug) console.log('[MQTT] connected via Paho');
-    return { connection, clientId };
-  }
-
-  /**
-   * Returns MQTT WebSocket connection info (SigV4 presigned URL, host, clientId).
-   * Safe to call for diagnostics/logging — use presignedUrlRedacted for logs.
-   */
   getPahoConnectionInfo = async (clientIdOverride?: string): Promise<PahoConnectionInfo> => {
-    const clientId = clientIdOverride ?? generateClientId(this.region, this.identityId);
     const info = buildPahoConnectionInfo({
       endpoint: this.iotEndpoint,
       region: this.region,
-      credentials: this.awsCredentials,
-      clientId,
+      credentials: this.credentials,
+      clientId: clientIdOverride ?? generateClientId(this.region, this.identityId),
       origin: this.siteBaseUrl,
     });
-    if (this.debug) {
-      // eslint-disable-next-line no-console
-      console.log('[PAHO][info]', {
-        host: info.host,
-        region: info.region,
-        clientId: info.clientId,
-        url: info.presignedUrlRedacted,
-      });
-    }
+    if (this.debug) console.log('[PAHO]', { host: info.host, clientId: info.clientId, url: info.presignedUrlRedacted });
     return info;
   };
 
-  private buildLabels(profile: ProfileJson): Record<string, { title: string; unit?: string }> {
-    const labels: Record<string, { title: string; unit?: string }> = Object.create(null);
+  private buildLabels(profile: ProfileJson): Labels {
+    const labels: Labels = Object.create(null);
     const record = (key: string, node: any) => {
-      const title = typeof node.title === 'string' ? node.title : labels[key]?.title ?? key;
-      const unit = typeof node.unit === 'string' ? node.unit : labels[key]?.unit;
-      labels[key] = { title, unit };
+      labels[key] = {
+        title: typeof node.title === 'string' ? node.title : labels[key]?.title ?? key,
+        unit: typeof node.unit === 'string' ? node.unit : labels[key]?.unit,
+      };
     };
     const visit = (n: any): void => {
       if (!n) return;
-      if (Array.isArray(n)) { for (const it of n) visit(it); return; }
+      if (Array.isArray(n)) { n.forEach(visit); return; }
       if (typeof n === 'object') {
         if (typeof n.parameterName === 'string') record(n.parameterName, n);
         if (typeof n.parameter === 'string') record(n.parameter, n);
@@ -249,242 +192,151 @@ export class EcoNetClient {
     return labels;
   }
 
-  private async ensureLabels(installationId: string, selector?: ProfileSelector): Promise<Record<string, { title: string; unit?: string }>> {
-    const cacheKey = JSON.stringify({ installationId, selector: selector ?? {} });
-    const cached = this.labelsCache.get(cacheKey);
-    if (cached) return cached;
+  /** Fetch translations for a profile descriptor, falling back to 'en' on error. */
+  private async fetchTranslations(a: { producerCode: string; deviceName: string; firmware: string; schema: string }): Promise<Record<string, string>> {
+    const tryLang = async (lang: string) => {
+      try { return await this.api.app.getTranslations({ ...a, lang }); } catch { return null; }
+    };
+    return (this.lang !== 'en' ? await tryLang(this.lang) : null) ?? await tryLang('en') ?? {};
+  }
+
+  private async ensureLabels(installationId: string, selector?: ProfileSelector): Promise<Labels> {
+    const cacheKey = JSON.stringify({ installationId, selector: selector ?? {}, lang: this.lang });
+    if (this.labelsCache.has(cacheKey)) return this.labelsCache.get(cacheKey)!;
 
     const details = await this.api.app.getInstallationDetails(installationId);
-    const components = Array.isArray(details.components) ? details.components : [];
 
     type Attempt = { producerCode: string; deviceName: string; firmware: string; schema: string };
-    const attempts: Attempt[] = [];
+    const seen = new Set<string>();
+    const plan: Attempt[] = [];
+    const addAttempt = (a: Attempt) => {
+      const k = `${a.producerCode}\x01${a.deviceName}\x01${a.firmware}\x01${a.schema}`;
+      if (!seen.has(k)) { seen.add(k); plan.push(a); }
+    };
 
-    // User-specified full selector first
-    if (selector?.producerCode && selector?.deviceName && selector?.firmware && selector?.schema) {
-      attempts.push({
-        producerCode: String(selector.producerCode),
-        deviceName: selector.deviceName,
-        firmware: selector.firmware,
-        schema: selector.schema,
-      });
+    if (selector?.producerCode && selector.deviceName && selector.firmware && selector.schema)
+      addAttempt({ producerCode: String(selector.producerCode), deviceName: selector.deviceName, firmware: selector.firmware, schema: selector.schema });
+
+    for (const c of (details.components ?? []) as any[]) {
+      const { producerCode: pc, componentType: dn, hardwareVersion: fw, softVersion: sc } = c ?? {};
+      if (pc != null && dn && fw && sc) addAttempt({ producerCode: String(pc), deviceName: dn, firmware: fw, schema: sc });
     }
+    if (!plan.length) throw new Error('Cannot resolve any profile descriptor from installation components');
 
-    // One attempt per component
-    for (const c of components as any[]) {
-      const pc = c?.producerCode, dn = c?.componentType, fw = c?.hardwareVersion, sc = c?.softVersion;
-      if (pc != null && dn && fw && sc) attempts.push({ producerCode: String(pc), deviceName: dn, firmware: fw, schema: sc });
-    }
-    if (!attempts.length) throw new Error('Cannot resolve any profile descriptor from installation components');
+    const merged: Labels = Object.create(null);
+    const trans: Record<string, string> = Object.create(null);
+    let lastErr: unknown;
 
-    // Deduplicate
-    const uniq = new Map<string, Attempt>();
-    for (const a of attempts) uniq.set(`${a.producerCode}\u0001${a.deviceName}\u0001${a.firmware}\u0001${a.schema}`, a);
-    const plan = Array.from(uniq.values());
-
-    const profiles: ProfileJson[] = [];
-    let lastErr: any = null;
     for (const a of plan) {
-      if (this.debug) console.log('[profile] try', `${a.producerCode}/${a.deviceName}/${a.firmware}/${a.schema}`);
+      if (this.debug) console.log('[profile]', `${a.producerCode}/${a.deviceName}/${a.firmware}/${a.schema}`);
       try {
-        const p = await this.api.app.getProfile(a);
-        if (this.debug) console.log('[profile] ok ', `${a.producerCode}/${a.deviceName}/${a.firmware}/${a.schema}`);
-        profiles.push(p);
+        const [profile, t] = await Promise.all([this.api.app.getProfile(a), this.fetchTranslations(a)]);
+        for (const [k, v] of Object.entries(this.buildLabels(profile))) if (!merged[k] || merged[k].title === k) merged[k] = v;
+        for (const [k, v] of Object.entries(t)) if (!trans[k]) trans[k] = v;
       } catch (e) {
         lastErr = e;
-        const msg = (e as Error)?.message ?? '';
-        if (/404/i.test(msg)) { if (this.debug) console.log('[profile] 404', `${a.producerCode}/${a.deviceName}/${a.firmware}/${a.schema}`); continue; }
-        if (this.debug) console.log('[profile] err', `${a.producerCode}/${a.deviceName}/${a.firmware}/${a.schema}`, msg);
+        if (/404/i.test((e as Error)?.message ?? '')) { if (this.debug) console.log('[profile] 404', `${a.producerCode}/${a.deviceName}`); continue; }
         throw e;
       }
     }
-    if (!profiles.length) throw lastErr || new Error('Failed to fetch profile.json for any component-derived descriptor');
+    if (!Object.keys(merged).length) throw lastErr ?? new Error('Failed to load any profile');
 
-    // Merge labels: prefer earlier profile entries; fill gaps or defaults (title===key)
-    const merged = profiles.reduce<Record<string, { title: string; unit?: string }>>((acc, p) => {
-      const map = this.buildLabels(p);
-      for (const k of Object.keys(map)) {
-        if (!acc[k] || acc[k].title === k) acc[k] = map[k];
-      }
-      return acc;
-    }, Object.create(null));
+    // Apply translations: resolve title keys, then fill params known only in translations
+    for (const k of Object.keys(merged)) {
+      const { title } = merged[k];
+      const resolved = trans[title] ?? (title === k ? trans[k] : undefined);
+      if (resolved) merged[k] = { ...merged[k], title: resolved };
+    }
+    for (const [k, v] of Object.entries(trans)) if (!merged[k]) merged[k] = { title: v };
 
     this.labelsCache.set(cacheKey, merged);
     return merged;
   }
 
-  private enrichMessageWithLabels(
-    msg: TopicMessage,
-    labels: Record<string, { title: string; unit?: string }>
-  ): TopicMessage & { labels: typeof labels; labeled?: any } {
+  private enrichWithLabels(msg: TopicMessage, labels: Labels): TopicMessage & { labels: Labels; labeled?: any } {
     const enriched: any = { ...msg, labels };
-    if (msg.json && typeof msg.json === 'object') {
-      const js: any = msg.json as any;
-      if (Array.isArray(js.messages)) {
-        enriched.labeled = {
-          messages: js.messages.map((m: any) => {
-            if (!m || !Array.isArray(m.targets)) return m;
-            return {
-              ...m,
-              targets: m.targets.map((t: any) => {
-                const params = t?.parameters && typeof t.parameters === 'object' ? t.parameters : {};
-                const labeledParams: Record<string, any> = {};
-                for (const key of Object.keys(params)) {
-                  const info = labels[key];
-                  const labelKey = info?.title ?? key;
-                  labeledParams[labelKey] = params[key];
-                }
-                return { ...t, parameters: labeledParams };
-              }),
-            };
-          }),
-        };
-      }
+    const js = msg.json as any;
+    if (Array.isArray(js?.messages)) {
+      enriched.labeled = {
+        messages: js.messages.map((m: any) => {
+          if (!Array.isArray(m?.targets)) return m;
+          return {
+            ...m,
+            targets: m.targets.map((t: any) => ({
+              ...t,
+              parameters: Object.fromEntries(
+                Object.entries(t?.parameters ?? {}).map(([k, v]) => [labels[k]?.title ?? k, v])
+              ),
+            })),
+          };
+        }),
+      };
     }
     return enriched;
   }
 
-  // Public API methods
+  // ── REST proxies ──────────────────────────────────────────────────────────
   getNotifications: ApiClients['app']['getNotifications'] = (opts) => this.api.app.getNotifications(opts);
   getInstallations: ApiClients['app']['getInstallations'] = (opts) => this.api.app.getInstallations(opts);
   getInstallationDetails: ApiClients['app']['getInstallationDetails'] = (id, opts) => this.api.app.getInstallationDetails(id, opts);
-  getProfile: ApiClients['app']['getProfile'] = (params, opts) => this.api.app.getProfile(params, opts);
+  getProfile: ApiClients['app']['getProfile'] = (p, opts) => this.api.app.getProfile(p, opts);
+  getTranslations: ApiClients['app']['getTranslations'] = (p, opts) => this.api.app.getTranslations(p, opts);
   postRegisteredDataValues: ApiClients['econet']['postRegisteredDataValues'] = (id, body, opts) => this.api.econet.postRegisteredDataValues(id, body, opts);
 
-  getInstallationParameters = async (
-    installationId: string,
-    opts?: MqttStreamOptions
-  ): Promise<Array<{ key: string; title: string; unit?: string }>> => {
-    const labels = await this.ensureLabels(installationId, opts?.profile);
-    return Object.keys(labels)
-      .sort()
-      .map((key) => ({ key, title: labels[key]?.title ?? key, unit: labels[key]?.unit }));
+  getInstallationParameters = async (id: string, opts?: MqttStreamOptions) => {
+    const labels = await this.ensureLabels(id, opts?.profile);
+    return Object.keys(labels).sort().map((key) => ({ key, title: labels[key].title, unit: labels[key].unit }));
   };
 
-  installationNotifications$ = (installationId: string, opts?: MqttStreamOptions) =>
-    defer(() => Promise.all([this.ensureMqtt(), this.ensureLabels(installationId, opts?.profile)])).pipe(
+  // ── MQTT streams ──────────────────────────────────────────────────────────
+  installationNotifications$ = (id: string, opts?: MqttStreamOptions) =>
+    defer(() => Promise.all([this.ensureMqtt(), this.ensureLabels(id, opts?.profile)] as const)).pipe(
       switchMap(([{ connection }, labels]) =>
-        streamInstallationNotifications$(connection, installationId).pipe(
-          map((msg) => this.enrichMessageWithLabels(msg, labels))
-        )
+        streamNotifications$(connection, id).pipe(map((msg) => this.enrichWithLabels(msg, labels)))
       )
     );
 
-  installationResponse$ = (installationId: string, customClientId?: string, opts?: MqttStreamOptions) =>
-    defer(() => Promise.all([this.ensureMqtt(), this.ensureLabels(installationId, opts?.profile)])).pipe(
+  installationResponse$ = (id: string, customClientId?: string, opts?: MqttStreamOptions) =>
+    defer(() => Promise.all([this.ensureMqtt(), this.ensureLabels(id, opts?.profile)] as const)).pipe(
       switchMap(([{ connection, clientId }, labels]) =>
-        streamInstallationResponse$(connection, installationId, customClientId ?? clientId).pipe(
-          map((msg) => this.enrichMessageWithLabels(msg, labels))
-        )
+        streamResponse$(connection, id, customClientId ?? clientId).pipe(map((msg) => this.enrichWithLabels(msg, labels)))
       )
     );
 
-  /**
-   * Publish an installationRequest message to ask the device/cloud for data.
-   * Note: The exact payload structure depends on the device/profile. Provide a body matching your target.
-   */
-  sendInstallationRequest = async (installationId: string, body: unknown, clientIdOverride?: string): Promise<void> => {
+  sendInstallationRequest = async (id: string, body: unknown, clientIdOverride?: string): Promise<void> => {
     const { connection, clientId } = await this.ensureMqtt();
-    await publishInstallationRequest(connection, installationId, clientIdOverride ?? clientId, body);
+    await publishRequest(connection, id, clientIdOverride ?? clientId, body);
   };
 
-  /** Resolve all parameters for installation and request their values in chunks. */
-  requestAllValues = async (
-    installationId: string,
-    opts?: {
-      componentId?: string;
-      chunkSize?: number;
-      transactionStart?: number;
-      profile?: ProfileSelector;
-      clientIdOverride?: string;
-    }
-  ): Promise<number> => {
-    const labels = await this.ensureLabels(installationId, opts?.profile);
-    const keys = Object.keys(labels).sort();
-    if (keys.length === 0) return 0;
+  // ── MQTT operations ───────────────────────────────────────────────────────
+  private sendOp = (id: string, tx: string, name: string, targets?: unknown[], override?: string) =>
+    this.sendInstallationRequest(id, { transactionId: tx, operations: [targets ? { name, targets } : { name }] }, override);
 
-    let component = opts?.componentId;
-    if (!component) {
-      const details = await this.getInstallationDetails(installationId);
-      component = (details.components || []).find((c: any) => !!c?.componentFn)?.componentFn as string | undefined;
-    }
+  requestComponentsOnBus = (id: string, tx = '1', override?: string) =>
+    this.sendOp(id, tx, 'GET_COMPONENTS_ON_BUS', undefined, override);
+
+  requestValues = (id: string, componentId: string, parameters: string[], tx = '2', override?: string) =>
+    this.sendOp(id, tx, 'GET_VALUES', [{ component: componentId, parameters }], override);
+
+  setValues = (id: string, componentId: string, values: Record<string, string>, tx = '10', override?: string) =>
+    this.sendOp(id, tx, 'PARAMS_MODIFICATION', [{ component: componentId, parameters: values }], override);
+
+  requestAllValues = async (id: string, opts?: { componentId?: string; chunkSize?: number; transactionStart?: number; profile?: ProfileSelector; clientIdOverride?: string }): Promise<number> => {
+    const labels = await this.ensureLabels(id, opts?.profile);
+    const keys = Object.keys(labels).sort();
+    if (!keys.length) return 0;
+
+    const component = opts?.componentId
+      ?? (await this.getInstallationDetails(id)).components?.find((c: any) => c?.componentFn)?.componentFn;
     if (!component) throw new Error('Cannot determine componentId to request values for');
 
-    const chunkSize = Math.max(1, Math.trunc(opts?.chunkSize ?? this.defaultChunkSize));
+    const chunk = Math.max(1, Math.trunc(opts?.chunkSize ?? this.chunkSize));
     let tx = Math.trunc(opts?.transactionStart ?? 1000);
-    for (let i = 0; i < keys.length; i += chunkSize) {
-      const chunk = keys.slice(i, i + chunkSize);
-      await this.requestValues(installationId, component, chunk, String(tx++), opts?.clientIdOverride);
-    }
+    for (let i = 0; i < keys.length; i += chunk)
+      await this.requestValues(id, component, keys.slice(i, i + chunk), String(tx++), opts?.clientIdOverride);
     return keys.length;
   };
 
-  /** Convenience: publish GET_COMPONENTS_ON_BUS */
-  requestComponentsOnBus = async (
-    installationId: string,
-    transactionId = '1',
-    clientIdOverride?: string
-  ): Promise<void> => {
-    await this.sendInstallationRequest(installationId, { transactionId, operations: [{ name: 'GET_COMPONENTS_ON_BUS' }] }, clientIdOverride);
-  };
-
-  /** Convenience: publish GET_VALUES for selected component and parameters */
-  requestValues = async (
-    installationId: string,
-    componentId: string,
-    parameters: string[],
-    transactionId = '2',
-    clientIdOverride?: string
-  ): Promise<void> => {
-    const body = {
-      transactionId,
-      operations: [
-        {
-          name: 'GET_VALUES',
-          targets: [
-            {
-              component: componentId,
-              parameters,
-            },
-          ],
-        },
-      ],
-    } as const;
-    await this.sendInstallationRequest(installationId, body, clientIdOverride);
-  };
-
-  /**
-   * Discover components and request initial values. If componentId/parameters are not provided,
-   * picks the first component from installation details and requests a small default set.
-   */
-  primeInstallation = async (
-    installationId: string,
-    opts?: {
-      componentId?: string;
-      parameters?: string[];
-      transactionIds?: { discover?: string; values?: string };
-      clientIdOverride?: string;
-    }
-  ): Promise<void> => {
-    const discoverId = opts?.transactionIds?.discover ?? '1';
-    const valuesId = opts?.transactionIds?.values ?? '2';
-    await this.requestComponentsOnBus(installationId, discoverId, opts?.clientIdOverride);
-    let component = opts?.componentId;
-    if (!component) {
-      try {
-        const details = await this.getInstallationDetails(installationId);
-        const first = (details.components || []).find((c: any) => !!c?.componentFn);
-        component = first?.componentFn as string | undefined;
-      } catch {}
-    }
-    const params = opts?.parameters ?? ['u6342', 'u6338', 'u81'];
-    if (component) {
-      await this.requestValues(installationId, component, params, valuesId, opts?.clientIdOverride);
-    }
-  };
 }
 
-export async function EcoNetAPIClient(init: EcoNetInit): Promise<EcoNetAPIClient> {
-  return EcoNetClient.create(init);
-}
-
+export const EcoNetAPIClient = (init: EcoNetInit): Promise<EcoNetAPIClient> => EcoNetClient.create(init);
