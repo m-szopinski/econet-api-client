@@ -1,4 +1,4 @@
-import { createApiClients, ApiClients } from '../services/api.js';
+import { createApiClients, ApiClients, RegisteredDataValuesRequest } from '../services/api.js';
 import { loginWithCognitoSRP } from '../services/cognitoLogin.js';
 import { getCognitoIdentityCredentials } from '../services/cognitoIdentity.js';
 import { createSigv4Fetcher } from '../services/sigv4Fetch.js';
@@ -22,6 +22,22 @@ export type ProfileSelector = {
 };
 
 export type MqttStreamOptions = { profile?: ProfileSelector };
+
+/** RegisteredDataValuesResponse with translated parameter keys and units. */
+export type LabeledRegisteredDataValuesResponse = {
+  installation?: string;
+  components?: Array<{
+    factoryNumber?: string;
+    parameters?: Array<{
+      key?: string;
+      label?: string;
+      unit?: string;
+      timestamps?: number[];
+      values?: number[];
+      isDownsampled?: boolean;
+    }>;
+  }>;
+};
 
 export type EcoNetInit = {
   username: string;
@@ -48,9 +64,13 @@ export type EcoNetAPIClient = {
   getNotifications: ApiClients['app']['getNotifications'];
   getProfile: ApiClients['app']['getProfile'];
   getTranslations: ApiClients['app']['getTranslations'];
-  postRegisteredDataValues: ApiClients['econet']['postRegisteredDataValues'];
+  postRegisteredDataValues: (
+    id: string,
+    body: RegisteredDataValuesRequest,
+    opts?: { headers?: Record<string, string> }
+  ) => Promise<LabeledRegisteredDataValuesResponse>;
   /** Lists all known parameters (key + human label) by loading component profiles + translations. */
-  getInstallationParameters: (id: string, opts?: MqttStreamOptions) => Promise<Array<{ key: string; title: string; unit?: string }>>;
+  getInstallationParameters: (id: string, opts?: MqttStreamOptions) => Promise<Array<{ key: string; label: string; unit?: string }>>;
   getPahoConnectionInfo: (clientIdOverride?: string) => Promise<PahoConnectionInfo>;
   installationNotifications$: (id: string, opts?: MqttStreamOptions) => Observable<TopicMessage>;
   installationResponse$: (id: string, clientId?: string, opts?: MqttStreamOptions) => Observable<TopicMessage>;
@@ -173,19 +193,20 @@ export class EcoNetClient {
 
   private buildLabels(profile: ProfileJson): Labels {
     const labels: Labels = Object.create(null);
-    const record = (key: string, node: any) => {
+    const record = (key: string, title: string | undefined, unit: string | undefined) => {
       labels[key] = {
-        title: typeof node.title === 'string' ? node.title : labels[key]?.title ?? key,
-        unit: typeof node.unit === 'string' ? node.unit : labels[key]?.unit,
+        title: title ?? labels[key]?.title ?? key,
+        unit: unit ?? labels[key]?.unit,
       };
     };
-    const visit = (n: any): void => {
+    const visit = (n: any, parentTitle?: string): void => {
       if (!n) return;
-      if (Array.isArray(n)) { n.forEach(visit); return; }
+      if (Array.isArray(n)) { n.forEach(item => visit(item, parentTitle)); return; }
       if (typeof n === 'object') {
-        if (typeof n.parameterName === 'string') record(n.parameterName, n);
-        if (typeof n.parameter === 'string') record(n.parameter, n);
-        for (const k in n) visit(n[k]);
+        const nodeTitle = typeof n.title === 'string' ? n.title : parentTitle;
+        if (typeof n.parameterName === 'string') record(n.parameterName, nodeTitle, typeof n.unit === 'string' ? n.unit : undefined);
+        if (typeof n.parameter === 'string') record(n.parameter, nodeTitle, typeof n.unit === 'string' ? n.unit : undefined);
+        for (const k in n) visit(n[k], nodeTitle);
       }
     };
     try { visit(profile); } catch {}
@@ -217,6 +238,11 @@ export class EcoNetClient {
     if (selector?.producerCode && selector.deviceName && selector.firmware && selector.schema)
       addAttempt({ producerCode: String(selector.producerCode), deviceName: selector.deviceName, firmware: selector.firmware, schema: selector.schema });
 
+    // Gateway (installationInfo) — the app fetches this profile separately, it carries many parameters
+    const info = details.installationInfo as any;
+    if (info?.producerCode != null && info?.name && info?.hardwareVersion && info?.softVersion)
+      addAttempt({ producerCode: String(info.producerCode & 0xFFFF), deviceName: info.name, firmware: info.hardwareVersion, schema: info.softVersion });
+
     for (const c of (details.components ?? []) as any[]) {
       const { producerCode: pc, componentType: dn, hardwareVersion: fw, softVersion: sc } = c ?? {};
       if (pc != null && dn && fw && sc) addAttempt({ producerCode: String(pc), deviceName: dn, firmware: fw, schema: sc });
@@ -241,10 +267,13 @@ export class EcoNetClient {
     }
     if (!Object.keys(merged).length) throw lastErr ?? new Error('Failed to load any profile');
 
-    // Apply translations: resolve title keys, then fill params known only in translations
+    // Apply translations: resolve title keys, then fill params known only in translations.
+    // Try in order: exact title match → title without leading @ → profile key (u####) directly.
     for (const k of Object.keys(merged)) {
       const { title } = merged[k];
-      const resolved = trans[title] ?? (title === k ? trans[k] : undefined);
+      const resolved = trans[title]
+        ?? (title.startsWith('@') ? trans[title.slice(1)] : undefined)
+        ?? trans[k];
       if (resolved) merged[k] = { ...merged[k], title: resolved };
     }
     for (const [k, v] of Object.entries(trans)) if (!merged[k]) merged[k] = { title: v };
@@ -256,22 +285,43 @@ export class EcoNetClient {
   private enrichWithLabels(msg: TopicMessage, labels: Labels): TopicMessage & { labels: Labels; labeled?: any } {
     const enriched: any = { ...msg, labels };
     const js = msg.json as any;
-    if (Array.isArray(js?.messages)) {
-      enriched.labeled = {
-        messages: js.messages.map((m: any) => {
-          if (!Array.isArray(m?.targets)) return m;
-          return {
-            ...m,
-            targets: m.targets.map((t: any) => ({
-              ...t,
-              parameters: Object.fromEntries(
-                Object.entries(t?.parameters ?? {}).map(([k, v]) => [labels[k]?.title ?? k, v])
-              ),
-            })),
-          };
-        }),
-      };
-    }
+    if (!Array.isArray(js?.messages)) return enriched;
+
+    // Extract the actual numeric value from raw MQTT param objects ({ "0": n } or { value: n|[n] })
+    const numVal = (raw: any): number | undefined => {
+      if (typeof raw === 'number')             return raw;
+      if (typeof raw?.['0'] === 'number')      return raw['0'];
+      if (typeof raw?.value === 'number')      return raw.value;
+      if (Array.isArray(raw?.value))           return raw.value[0];
+    };
+
+    enriched.labeled = {
+      messages: js.messages.map((m: any) => {
+        if (!Array.isArray(m?.targets)) return m;
+        return {
+          ...m,
+          targets: m.targets.map((t: any) => ({
+            ...t,
+            parameters: Object.fromEntries(
+              Object.entries(t?.parameters ?? {})
+                .map(([k, v]) => {
+                  // Resolve label: try key as-is, strip @ for @u#### / @semantic,
+                  // or prepend u for pure-numeric keys.
+                  const lbl = labels[k]
+                    ?? (/^@/.test(k) ? labels[k.slice(1)] : undefined)
+                    ?? (/^\d+$/.test(k) ? labels[`u${k}`] : undefined);
+                  const raw = v as any;
+                  const entry: Record<string, unknown> = { value: numVal(raw) };
+                  if (lbl?.title) entry.label = lbl.title;
+                  const unit = (typeof raw?.unit === 'string' ? raw.unit : undefined) ?? lbl?.unit;
+                  if (unit) entry.unit = unit;
+                  return [k, entry];
+                })
+            ),
+          })),
+        };
+      }),
+    };
     return enriched;
   }
 
@@ -281,11 +331,35 @@ export class EcoNetClient {
   getInstallationDetails: ApiClients['app']['getInstallationDetails'] = (id, opts) => this.api.app.getInstallationDetails(id, opts);
   getProfile: ApiClients['app']['getProfile'] = (p, opts) => this.api.app.getProfile(p, opts);
   getTranslations: ApiClients['app']['getTranslations'] = (p, opts) => this.api.app.getTranslations(p, opts);
-  postRegisteredDataValues: ApiClients['econet']['postRegisteredDataValues'] = (id, body, opts) => this.api.econet.postRegisteredDataValues(id, body, opts);
+  postRegisteredDataValues = async (
+    id: string,
+    body: RegisteredDataValuesRequest,
+    opts?: { headers?: Record<string, string> }
+  ): Promise<LabeledRegisteredDataValuesResponse> => {
+    const [raw, labels] = await Promise.all([
+      this.api.econet.postRegisteredDataValues(id, body, opts),
+      this.ensureLabels(id),
+    ] as const);
+    return {
+      ...raw,
+      components: raw.components?.map(comp => ({
+        ...comp,
+        parameters: comp.parameters?.map(p => ({
+          ...p,
+          label: p.key ? (labels[p.key]?.title ?? p.key) : undefined,
+          unit: p.key ? labels[p.key]?.unit : undefined,
+        })),
+      })),
+    };
+  };
 
   getInstallationParameters = async (id: string, opts?: MqttStreamOptions) => {
     const labels = await this.ensureLabels(id, opts?.profile);
-    return Object.keys(labels).sort().map((key) => ({ key, title: labels[key].title, unit: labels[key].unit }));
+    return Object.keys(labels).sort().map((key) => ({
+      key,
+      label: labels[key].title,
+      unit: labels[key].unit,
+    }));
   };
 
   // ── MQTT streams ──────────────────────────────────────────────────────────

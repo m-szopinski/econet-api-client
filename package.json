@@ -1,6 +1,6 @@
 {
   "name": "econet-api-client",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "EcoNet API Client for TypeScript: Cognito SRP auth, SigV4 REST, AWS IoT MQTT streams, and profile-based labels.",
   "type": "module",
   "main": "./dist/index.js",
